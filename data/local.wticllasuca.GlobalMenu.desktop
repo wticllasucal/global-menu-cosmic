@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Menú global
+Name[en]=Global Menu
+Comment=Menús de la aplicación seleccionada; requiere el puente del compositor
+Comment[en]=Selected application menus; requires the compositor bridge
+@EXEC@
+Icon=view-list-symbolic
+Terminal=false
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicApplet-RequestsWaylandDisplay=true
+Categories=Utility;

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="global_menu_bridge">
+  <copyright>SPDX-License-Identifier: GPL-3.0-only</copyright>
+  <interface name="zglobal_menu_bridge_v1" version="1">
+    <description summary="atomic application menu metadata snapshots">
+      Private experimental protocol for the matching applet and compositor patch.
+      active or clear starts a snapshot; done commits its serial. Exporter addresses
+      refer to the selected surface. Only non-sandboxed trusted session clients see
+      this global. It does not offer keyboard injection or window control.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <request name="get_snapshot"/>
+    <event name="active">
+      <arg name="serial" type="uint"/>
+      <arg name="window_id" type="string"/>
+      <arg name="app_id" type="string"/>
+      <arg name="title" type="string"/>
+      <arg name="pid" type="uint"/>
+      <arg name="xid" type="uint"/>
+    </event>
+    <event name="dbusmenu">
+      <arg name="serial" type="uint"/>
+      <arg name="bus_name" type="string"/>
+      <arg name="object_path" type="string"/>
+    </event>
+    <event name="gtk_menu">
+      <arg name="serial" type="uint"/>
+      <arg name="bus_name" type="string"/>
+      <arg name="menubar_path" type="string"/>
+      <arg name="app_menu_path" type="string"/>
+      <arg name="application_path" type="string"/>
+      <arg name="window_path" type="string"/>
+    </event>
+    <event name="clear"><arg name="serial" type="uint"/></event>
+    <event name="done"><arg name="serial" type="uint"/></event>
+  </interface>
+</protocol>

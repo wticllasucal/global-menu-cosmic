@@ -1,0 +1,54 @@
+{
+  "Cargo.toml": {
+    "before": "d6e9de452e53dde69e63f977f3bdbc95c625ceb527353295b8a13380537694a7",
+    "after": "2b529d2cf4d6db4a735928aa2706a7d57d8ce58cbe11e8f36a8097234214921d"
+  },
+  "src/shell/mod.rs": {
+    "before": "9e9c4dad361acccf567272b10838a5f53a5272fd09719d1ed6d382e5a853b149",
+    "after": "1d8a29fea6470f8bfb5fcf22e5c6f6d3de2a8977c4cf6ee513f058a8179a75ea"
+  },
+  "src/state.rs": {
+    "before": "8ca40ed25f25a52101c509837631d96ed826ed676dd51a695642f5ec755b4475",
+    "after": "77b79c4e6fb556486da136300f0433f2a962c8ba4f75ed4897064a5990de2b12"
+  },
+  "src/wayland/handlers/global_menu.rs": {
+    "before": null,
+    "after": "95f998b59938d7fbd28d159d84379aa21613a0a4f41fbf33c83e3fe3e7bd685a"
+  },
+  "src/wayland/handlers/mod.rs": {
+    "before": "3b999427068f55fed93fdb6f21e73210438e5bf5dd057793d5f1a0143431039c",
+    "after": "9ffd77d04f7e4644a9aa18908875b99a1028258551cdcf99f19cca7af66f897d"
+  },
+  "vendor/cosmic-global-menu-bridge/Cargo.toml": {
+    "before": null,
+    "after": "80f7168532aebfc89aec9e17fdbbb7e0c64b635aecc4f1bd8e88caafbf1f23a5"
+  },
+  "vendor/cosmic-global-menu-bridge/protocols/appmenu.xml": {
+    "before": null,
+    "after": "dfee362b036333a9c797a388b7ba65b2c3d049d0020f549649efe03b40878f79"
+  },
+  "vendor/cosmic-global-menu-bridge/protocols/global-menu.xml": {
+    "before": null,
+    "after": "92e00dd9c36864b8d7a0cd96aa877c6ba7d543ec6e791125fb819c6940a2320a"
+  },
+  "vendor/cosmic-global-menu-bridge/protocols/gtk-shell.xml": {
+    "before": null,
+    "after": "1d3e4f3d216db281eb281c8140e57b72b95a50539d9006020c95b0d3b3a3b918"
+  },
+  "vendor/cosmic-global-menu-bridge/src/lib.rs": {
+    "before": null,
+    "after": "241cae06c6b4d54d1dcf8966a79e8b75a8fd903cbe2cbd2864a9301d9dbc554c"
+  },
+  "vendor/cosmic-global-menu-bridge/src/model.rs": {
+    "before": null,
+    "after": "c38bc987db1b57db6f9398564bc858ab1b158c41b09b045d3f6bab62034b429f"
+  },
+  "vendor/cosmic-global-menu-bridge/src/protocols.rs": {
+    "before": null,
+    "after": "fd66edba39a20e6c5c0d297ad404c1e647189d243dedab0b8ed714d143cd5c9b"
+  },
+  "vendor/cosmic-global-menu-bridge/src/server.rs": {
+    "before": null,
+    "after": "52d7962b76aabb1576f7ab39ba0b43b33fe9da567dfaa31a9ccde5ba0acec7ef"
+  }
+}

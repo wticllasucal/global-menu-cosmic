@@ -1,0 +1,1115 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 7cb45fc..84aff6f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -10,6 +10,7 @@ rust-version = "1.93"
+ members = ["cosmic-comp-config"]
+ 
+ [dependencies]
++cosmic-global-menu-bridge = { path = "vendor/cosmic-global-menu-bridge", default-features = false }
+ anyhow = { version = "1.0.102", features = ["backtrace"] }
+ bitflags = "2.11.0"
+ calloop = { version = "0.14.4", features = ["executor", "stream"] }
+diff --git a/src/shell/mod.rs b/src/shell/mod.rs
+index 108307b..cd0ad5f 100644
+--- a/src/shell/mod.rs
++++ b/src/shell/mod.rs
+@@ -1641,6 +1641,7 @@ impl Common {
+         );
+         self.popups.cleanup();
+         self.toplevel_info_state.refresh(&self.workspace_state);
++        self.refresh_global_menu();
+         self.refresh_idle_inhibit();
+         if let Some(mut a11y_keyboard_monitor) = self.dbus_state.a11y_keyboard_monitor() {
+             a11y_keyboard_monitor.refresh();
+diff --git a/src/state.rs b/src/state.rs
+index e3d170b..425ea71 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -313,6 +313,8 @@ pub struct Common {
+     pub xdg_shell_state: XdgShellState,
+     pub layer_shell_state: WlrLayerShellState,
+     pub toplevel_info_state: ToplevelInfoState<State, CosmicSurface>,
++    pub global_menu_state: cosmic_global_menu_bridge::GlobalMenuState,
++    pub global_menu_focus: cosmic_global_menu_bridge::FocusPolicy<CosmicSurface>,
+     pub toplevel_management_state: ToplevelManagementState,
+     pub xdg_activation_state: XdgActivationState,
+     pub xdg_foreign_state: XdgForeignState,
+@@ -749,6 +751,7 @@ impl State {
+         let xdg_activation_state = XdgActivationState::new::<State>(dh);
+         let xdg_foreign_state = XdgForeignState::new::<State>(dh);
+         let toplevel_info_state = ToplevelInfoState::new(dh, client_not_sandboxed);
++        let global_menu_state = cosmic_global_menu_bridge::GlobalMenuState::new::<State>(dh, client_not_sandboxed);
+         let toplevel_management_state = ToplevelManagementState::new::<State, _>(
+             dh,
+             vec![
+@@ -824,6 +827,8 @@ impl State {
+                 xdg_shell_state,
+                 layer_shell_state,
+                 toplevel_info_state,
++                global_menu_state,
++                global_menu_focus: Default::default(),
+                 toplevel_management_state,
+                 xdg_activation_state,
+                 xdg_foreign_state,
+diff --git a/src/wayland/handlers/global_menu.rs b/src/wayland/handlers/global_menu.rs
+new file mode 100644
+index 0000000..5b862ca
+--- /dev/null
++++ b/src/wayland/handlers/global_menu.rs
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Installed by the patch as src/wayland/handlers/global_menu.rs.
++use crate::{
++    shell::{CosmicSurface, focus::target::KeyboardFocusTarget},
++    state::{Common, State},
++};
++use cosmic_global_menu_bridge::wayland_server::Resource;
++use cosmic_global_menu_bridge::{
++    ActiveWindow, FocusInput, GlobalMenuHandler, GlobalMenuState, WindowInfo,
++};
++use smithay::{
++    desktop::{find_popup_root_surface, layer_map_for_output},
++    utils::IsAlive,
++    wayland::seat::WaylandFocus,
++};
++
++impl GlobalMenuHandler for State {
++    fn global_menu_state(&mut self) -> &mut GlobalMenuState {
++        &mut self.common.global_menu_state
++    }
++}
++cosmic_global_menu_bridge::delegate_global_menu!(State);
++
++impl Common {
++    pub fn refresh_global_menu(&mut self) {
++        let input = {
++            let shell = self.shell.read();
++            let focus = shell
++                .seats
++                .last_active()
++                .get_keyboard()
++                .and_then(|keyboard| keyboard.current_focus());
++            if shell.session_lock.is_some() {
++                FocusInput::Locked
++            } else if let Some(window) = focus.as_ref().and_then(KeyboardFocusTarget::active_window)
++            {
++                FocusInput::Window(window)
++            } else {
++                match focus {
++                    Some(KeyboardFocusTarget::LayerSurface(_)) => FocusInput::Panel,
++                    Some(KeyboardFocusTarget::Popup(popup)) => {
++                        let root = find_popup_root_surface(&popup).ok();
++                        let selected = self.global_menu_focus.selected();
++                        let own_popup = root.as_ref().is_some_and(|root| {
++                            selected.is_some_and(|s| s.wl_surface().as_deref() == Some(root))
++                        });
++                        let layer_popup = root.as_ref().is_some_and(|root| {
++                            shell.outputs().any(|output| {
++                                layer_map_for_output(output)
++                                    .layers()
++                                    .any(|layer| layer.wl_surface() == root)
++                            })
++                        });
++                        if own_popup || layer_popup {
++                            FocusInput::Panel
++                        } else {
++                            FocusInput::Other
++                        }
++                    }
++                    Some(KeyboardFocusTarget::LockSurface(_)) => FocusInput::Locked,
++                    _ => FocusInput::Other,
++                }
++            }
++        };
++        let alive = self
++            .global_menu_focus
++            .selected()
++            .is_some_and(|window| window.alive() && !window.is_minimized());
++        let selected = self.global_menu_focus.observe(input, alive);
++        let active = selected.and_then(|window| self.menu_window(&window));
++        self.global_menu_state.set_active(active);
++        self.global_menu_state.refresh();
++    }
++
++    fn menu_window(&mut self, window: &CosmicSurface) -> Option<ActiveWindow> {
++        if !window.alive() || window.is_minimized() {
++            return None;
++        }
++        let surface = window.wl_surface().map(|s| s.into_owned());
++        let x11 = window.x11_surface();
++        let xid = x11.map(|s| s.window_id()).unwrap_or(0);
++        let pid = x11
++            .and_then(|s| s.pid())
++            .or_else(|| {
++                surface
++                    .as_ref()?
++                    .client()?
++                    .get_credentials(&self.display_handle)
++                    .ok()
++                    .and_then(|c| u32::try_from(c.pid).ok())
++            })
++            .unwrap_or(0);
++        let id = if xid != 0 {
++            (1u64 << 63) | u64::from(xid)
++        } else {
++            self.global_menu_state.surface_key(surface.as_ref()?).ok()?
++        };
++        Some(ActiveWindow {
++            info: WindowInfo {
++                id,
++                app_id: window.app_id(),
++                title: window.title(),
++                pid,
++                xid,
++            },
++            surface,
++        })
++    }
++}
+diff --git a/src/wayland/handlers/mod.rs b/src/wayland/handlers/mod.rs
+index 3757dd8..bdc847f 100644
+--- a/src/wayland/handlers/mod.rs
++++ b/src/wayland/handlers/mod.rs
+@@ -14,6 +14,7 @@ pub mod drm_lease;
+ pub mod drm_syncobj;
+ pub mod foreign_toplevel_list;
+ pub mod fractional_scale;
++pub mod global_menu;
+ pub mod idle_inhibit;
+ pub mod idle_notify;
+ pub mod image_capture_source;
+diff --git a/vendor/cosmic-global-menu-bridge/Cargo.toml b/vendor/cosmic-global-menu-bridge/Cargo.toml
+new file mode 100644
+index 0000000..f11c440
+--- /dev/null
++++ b/vendor/cosmic-global-menu-bridge/Cargo.toml
+@@ -0,0 +1,19 @@
++[package]
++name = "cosmic-global-menu-bridge"
++version = "0.1.0"
++edition = "2024"
++license = "GPL-3.0-only"
++
++[features]
++default = ["client"]
++client = ["dep:wayland-client"]
++
++[dependencies]
++wayland-backend = "0.3"
++wayland-client = { version = "0.31", optional = true }
++wayland-server = "0.31"
++wayland-scanner = "0.31"
++zbus_names = "4"
++
++[dev-dependencies]
++wayland-client = "0.31"
+diff --git a/vendor/cosmic-global-menu-bridge/protocols/appmenu.xml b/vendor/cosmic-global-menu-bridge/protocols/appmenu.xml
+new file mode 100644
+index 0000000..42d1c0e
+--- /dev/null
++++ b/vendor/cosmic-global-menu-bridge/protocols/appmenu.xml
+@@ -0,0 +1,24 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="appmenu">
++  <copyright><![CDATA[
++    SPDX-FileCopyrightText: 2017 David Edmundson
++    SPDX-License-Identifier: MIT
++  ]]></copyright>
++  <interface name="org_kde_kwin_appmenu_manager" version="2">
++    <description summary="appmenu dbus address interface">
++      Links a surface to a com.canonical.dbusmenu object on the session bus.
++    </description>
++    <request name="create">
++      <arg name="id" type="new_id" interface="org_kde_kwin_appmenu"/>
++      <arg name="surface" type="object" interface="wl_surface"/>
++    </request>
++    <request name="release" type="destructor" since="2"/>
++  </interface>
++  <interface name="org_kde_kwin_appmenu" version="2">
++    <request name="set_address">
++      <arg name="service_name" type="string"/>
++      <arg name="object_path" type="string"/>
++    </request>
++    <request name="release" type="destructor"/>
++  </interface>
++</protocol>
+diff --git a/vendor/cosmic-global-menu-bridge/protocols/global-menu.xml b/vendor/cosmic-global-menu-bridge/protocols/global-menu.xml
+new file mode 100644
+index 0000000..78cbb8e
+--- /dev/null
++++ b/vendor/cosmic-global-menu-bridge/protocols/global-menu.xml
+@@ -0,0 +1,37 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="global_menu_bridge">
++  <copyright>SPDX-License-Identifier: GPL-3.0-only</copyright>
++  <interface name="zglobal_menu_bridge_v1" version="1">
++    <description summary="atomic application menu metadata snapshots">
++      Private experimental protocol for the matching applet and compositor patch.
++      active or clear starts a snapshot; done commits its serial. Exporter addresses
++      refer to the selected surface. Only non-sandboxed trusted session clients see
++      this global. It does not offer keyboard injection or window control.
++    </description>
++    <request name="destroy" type="destructor"/>
++    <request name="get_snapshot"/>
++    <event name="active">
++      <arg name="serial" type="uint"/>
++      <arg name="window_id" type="string"/>
++      <arg name="app_id" type="string"/>
++      <arg name="title" type="string"/>
++      <arg name="pid" type="uint"/>
++      <arg name="xid" type="uint"/>
++    </event>
++    <event name="dbusmenu">
++      <arg name="serial" type="uint"/>
++      <arg name="bus_name" type="string"/>
++      <arg name="object_path" type="string"/>
++    </event>
++    <event name="gtk_menu">
++      <arg name="serial" type="uint"/>
++      <arg name="bus_name" type="string"/>
++      <arg name="menubar_path" type="string"/>
++      <arg name="app_menu_path" type="string"/>
++      <arg name="application_path" type="string"/>
++      <arg name="window_path" type="string"/>
++    </event>
++    <event name="clear"><arg name="serial" type="uint"/></event>
++    <event name="done"><arg name="serial" type="uint"/></event>
++  </interface>
++</protocol>
+diff --git a/vendor/cosmic-global-menu-bridge/protocols/gtk-shell.xml b/vendor/cosmic-global-menu-bridge/protocols/gtk-shell.xml
+new file mode 100644
+index 0000000..0552c6a
+--- /dev/null
++++ b/vendor/cosmic-global-menu-bridge/protocols/gtk-shell.xml
+@@ -0,0 +1,62 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!-- GTK protocol wire contract: GNOME/gtk, gtk-3-24,
++     gdk/wayland/protocol/gtk-shell.xml. LGPL-2.1-or-later.
++     The bridge advertises version 1, not version 5. -->
++<protocol name="gtk">
++  <interface name="gtk_shell1" version="5">
++    <enum name="capability">
++      <entry name="global_app_menu" value="1"/>
++      <entry name="global_menu_bar" value="2"/>
++      <entry name="desktop_icons" value="3"/>
++    </enum>
++    <event name="capabilities"><arg name="capabilities" type="uint"/></event>
++    <request name="get_gtk_surface">
++      <arg name="gtk_surface" type="new_id" interface="gtk_surface1"/>
++      <arg name="surface" type="object" interface="wl_surface"/>
++    </request>
++    <request name="set_startup_id"><arg name="startup_id" type="string" allow-null="true"/></request>
++    <request name="system_bell"><arg name="surface" type="object" interface="gtk_surface1" allow-null="true"/></request>
++    <request name="notify_launch" since="3"><arg name="startup_id" type="string"/></request>
++  </interface>
++  <interface name="gtk_surface1" version="5">
++    <request name="set_dbus_properties">
++      <arg name="application_id" type="string" allow-null="true"/>
++      <arg name="app_menu_path" type="string" allow-null="true"/>
++      <arg name="menubar_path" type="string" allow-null="true"/>
++      <arg name="window_object_path" type="string" allow-null="true"/>
++      <arg name="application_object_path" type="string" allow-null="true"/>
++      <arg name="unique_bus_name" type="string" allow-null="true"/>
++    </request>
++    <request name="set_modal"/>
++    <request name="unset_modal"/>
++    <request name="present"><arg name="time" type="uint"/></request>
++    <enum name="state">
++      <entry name="tiled" value="1"/>
++      <entry name="tiled_top" value="2" since="2"/>
++      <entry name="tiled_right" value="3" since="2"/>
++      <entry name="tiled_bottom" value="4" since="2"/>
++      <entry name="tiled_left" value="5" since="2"/>
++    </enum>
++    <enum name="edge_constraint" since="2">
++      <entry name="resizable_top" value="1"/>
++      <entry name="resizable_right" value="2"/>
++      <entry name="resizable_bottom" value="3"/>
++      <entry name="resizable_left" value="4"/>
++    </enum>
++    <event name="configure"><arg name="states" type="array"/></event>
++    <event name="configure_edges" since="2"><arg name="constraints" type="array"/></event>
++    <request name="request_focus" since="3"><arg name="startup_id" type="string" allow-null="true"/></request>
++    <request name="release" type="destructor" since="4"/>
++    <enum name="gesture" since="5">
++      <entry name="double_click" value="1"/>
++      <entry name="right_click" value="2"/>
++      <entry name="middle_click" value="3"/>
++    </enum>
++    <enum name="error" since="5"><entry name="invalid_gesture" value="0"/></enum>
++    <request name="titlebar_gesture" since="5">
++      <arg name="serial" type="uint"/>
++      <arg name="seat" type="object" interface="wl_seat"/>
++      <arg name="gesture" type="uint" enum="gesture"/>
++    </request>
++  </interface>
++</protocol>
+diff --git a/vendor/cosmic-global-menu-bridge/src/lib.rs b/vendor/cosmic-global-menu-bridge/src/lib.rs
+new file mode 100644
+index 0000000..2638e9d
+--- /dev/null
++++ b/vendor/cosmic-global-menu-bridge/src/lib.rs
+@@ -0,0 +1,7 @@
++// SPDX-License-Identifier: GPL-3.0-only
++mod model;
++pub use model::*;
++pub mod protocols;
++mod server;
++pub use server::*;
++pub use wayland_server;
+diff --git a/vendor/cosmic-global-menu-bridge/src/model.rs b/vendor/cosmic-global-menu-bridge/src/model.rs
+new file mode 100644
+index 0000000..42a1437
+--- /dev/null
++++ b/vendor/cosmic-global-menu-bridge/src/model.rs
+@@ -0,0 +1,178 @@
++// SPDX-License-Identifier: GPL-3.0-only
++use std::collections::HashMap;
++use zbus_names::BusName;
++
++pub const MAX_SURFACES: usize = 4096;
++pub const MAX_ADDRESS: usize = 1024;
++
++pub fn valid_path(path: &str) -> bool {
++    path.len() <= MAX_ADDRESS
++        && (path == "/"
++            || (path.starts_with('/')
++                && path[1..].split('/').all(|part| {
++                    !part.is_empty() && part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
++                })))
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct DbusAddress {
++    pub bus_name: String,
++    pub path: String,
++}
++
++impl DbusAddress {
++    pub fn new(bus_name: &str, path: &str) -> Result<Self, String> {
++        if bus_name.len() > 255 || BusName::try_from(bus_name).is_err() || !valid_path(path) {
++            return Err("Destino D-Bus no válido".into());
++        }
++        Ok(Self {
++            bus_name: bus_name.into(),
++            path: path.into(),
++        })
++    }
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct GtkAddress {
++    pub bus_name: String,
++    pub menubar_path: String,
++    pub app_menu_path: String,
++    pub application_path: String,
++    pub window_path: String,
++}
++
++impl GtkAddress {
++    pub fn validate(&self) -> Result<(), String> {
++        if self.bus_name.len() > 255 || BusName::try_from(self.bus_name.as_str()).is_err() {
++            return Err("Nombre de bus GTK no válido".into());
++        }
++        for path in [
++            &self.menubar_path,
++            &self.app_menu_path,
++            &self.application_path,
++            &self.window_path,
++        ] {
++            if !path.is_empty() && !valid_path(path) {
++                return Err("Ruta GTK no válida".into());
++            }
++        }
++        Ok(())
++    }
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct SurfaceMenus {
++    pub dbusmenu: Option<DbusAddress>,
++    pub gtk: Option<GtkAddress>,
++}
++
++#[derive(Default, Debug)]
++pub struct MenuRegistry {
++    menus: HashMap<u64, SurfaceMenus>,
++}
++
++impl MenuRegistry {
++    pub fn set_dbusmenu(&mut self, surface: u64, bus: &str, path: &str) -> Result<(), String> {
++        if bus.is_empty() && path.is_empty() {
++            self.clear_dbusmenu(surface);
++            return Ok(());
++        }
++        let address = DbusAddress::new(bus, path)?;
++        self.check_capacity(surface)?;
++        self.menus.entry(surface).or_default().dbusmenu = Some(address);
++        Ok(())
++    }
++
++    pub fn set_gtk(&mut self, surface: u64, address: GtkAddress) -> Result<(), String> {
++        if address.bus_name.is_empty() {
++            self.clear_gtk(surface);
++            return Ok(());
++        }
++        address.validate()?;
++        self.check_capacity(surface)?;
++        self.menus.entry(surface).or_default().gtk = Some(address);
++        Ok(())
++    }
++
++    fn check_capacity(&self, surface: u64) -> Result<(), String> {
++        if self.menus.len() >= MAX_SURFACES && !self.menus.contains_key(&surface) {
++            return Err("Demasiadas superficies con menú".into());
++        }
++        Ok(())
++    }
++
++    pub fn get(&self, surface: u64) -> Option<&SurfaceMenus> {
++        self.menus.get(&surface)
++    }
++
++    pub fn remove(&mut self, surface: u64) {
++        self.menus.remove(&surface);
++    }
++
++    pub fn clear_dbusmenu(&mut self, surface: u64) {
++        if let Some(menus) = self.menus.get_mut(&surface) {
++            menus.dbusmenu = None;
++        }
++        self.remove_empty(surface);
++    }
++
++    pub fn clear_gtk(&mut self, surface: u64) {
++        if let Some(menus) = self.menus.get_mut(&surface) {
++            menus.gtk = None;
++        }
++        self.remove_empty(surface);
++    }
++
++    fn remove_empty(&mut self, surface: u64) {
++        if self
++            .menus
++            .get(&surface)
++            .is_some_and(|m| m.dbusmenu.is_none() && m.gtk.is_none())
++        {
++            self.remove(surface);
++        }
++    }
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct WindowInfo {
++    pub id: u64,
++    pub app_id: String,
++    pub title: String,
++    pub pid: u32,
++    pub xid: u32,
++}
++
++#[derive(Clone, Debug)]
++pub enum FocusInput<T = WindowInfo> {
++    Window(T),
++    Panel,
++    Locked,
++    Other,
++}
++
++#[derive(Debug)]
++pub struct FocusPolicy<T = WindowInfo> {
++    selected: Option<T>,
++}
++
++impl<T> Default for FocusPolicy<T> {
++    fn default() -> Self {
++        Self { selected: None }
++    }
++}
++
++impl<T: Clone> FocusPolicy<T> {
++    pub fn observe(&mut self, input: FocusInput<T>, selected_alive: bool) -> Option<T> {
++        self.selected = match input {
++            FocusInput::Window(window) => Some(window),
++            FocusInput::Panel if selected_alive => self.selected.clone(),
++            FocusInput::Panel | FocusInput::Locked | FocusInput::Other => None,
++        };
++        self.selected.clone()
++    }
++
++    pub fn selected(&self) -> Option<&T> {
++        self.selected.as_ref()
++    }
++}
+diff --git a/vendor/cosmic-global-menu-bridge/src/protocols.rs b/vendor/cosmic-global-menu-bridge/src/protocols.rs
+new file mode 100644
+index 0000000..8065073
+--- /dev/null
++++ b/vendor/cosmic-global-menu-bridge/src/protocols.rs
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: GPL-3.0-only
++macro_rules! server_protocol {
++    ($name:ident, $path:literal) => {
++        #[allow(unused_imports)]
++        pub mod $name {
++            use wayland_server;
++            use wayland_server::protocol::*;
++            pub mod __interfaces {
++                use wayland_server::protocol::__interfaces::*;
++                wayland_scanner::generate_interfaces!($path);
++            }
++            use self::__interfaces::*;
++            wayland_scanner::generate_server_code!($path);
++        }
++    };
++}
++
++pub mod server {
++    server_protocol!(appmenu, "protocols/appmenu.xml");
++    server_protocol!(gtk, "protocols/gtk-shell.xml");
++    server_protocol!(bridge, "protocols/global-menu.xml");
++}
++
++#[cfg(feature = "client")]
++pub mod client {
++    macro_rules! client_protocol {
++        ($name:ident, $path:literal) => {
++            #[allow(unused_imports)]
++            pub mod $name {
++                use wayland_client;
++                use wayland_client::protocol::*;
++                pub mod __interfaces {
++                    use wayland_client::protocol::__interfaces::*;
++                    wayland_scanner::generate_interfaces!($path);
++                }
++                use self::__interfaces::*;
++                wayland_scanner::generate_client_code!($path);
++            }
++        };
++    }
++    client_protocol!(appmenu, "protocols/appmenu.xml");
++    client_protocol!(gtk, "protocols/gtk-shell.xml");
++    client_protocol!(bridge, "protocols/global-menu.xml");
++}
+diff --git a/vendor/cosmic-global-menu-bridge/src/server.rs b/vendor/cosmic-global-menu-bridge/src/server.rs
+new file mode 100644
+index 0000000..fc5b144
+--- /dev/null
++++ b/vendor/cosmic-global-menu-bridge/src/server.rs
+@@ -0,0 +1,515 @@
++// SPDX-License-Identifier: GPL-3.0-only
++use crate::protocols::server::{
++    appmenu::{
++        org_kde_kwin_appmenu::{self, OrgKdeKwinAppmenu},
++        org_kde_kwin_appmenu_manager::{self, OrgKdeKwinAppmenuManager},
++    },
++    bridge::zglobal_menu_bridge_v1::{self, ZglobalMenuBridgeV1},
++    gtk::{
++        gtk_shell1::{self, GtkShell1},
++        gtk_surface1::{self, GtkSurface1},
++    },
++};
++use crate::{GtkAddress, MAX_SURFACES, MenuRegistry, SurfaceMenus, WindowInfo};
++use std::{collections::HashMap, sync::Arc};
++use wayland_server::{
++    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
++    backend::{ClientId, ObjectId},
++    protocol::wl_surface::WlSurface,
++};
++
++#[derive(Clone, Debug)]
++pub struct ActiveWindow {
++    pub info: WindowInfo,
++    pub surface: Option<WlSurface>,
++}
++
++pub trait GlobalMenuHandler: Sized {
++    fn global_menu_state(&mut self) -> &mut GlobalMenuState;
++}
++
++#[derive(Clone)]
++pub struct BridgeGlobalData(pub Arc<dyn Fn(&Client) -> bool + Send + Sync>);
++
++#[derive(Clone, Debug)]
++pub struct SurfaceResourceData {
++    pub surface: WlSurface,
++    pub key: u64,
++}
++
++#[derive(Debug)]
++struct SurfaceRecord {
++    data: SurfaceResourceData,
++    dbus_owner: Option<ObjectId>,
++    gtk_owner: Option<ObjectId>,
++}
++
++#[derive(Clone, Default, Debug, PartialEq, Eq)]
++struct Published {
++    window: Option<WindowInfo>,
++    menus: SurfaceMenus,
++}
++
++pub struct GlobalMenuState {
++    registry: MenuRegistry,
++    surfaces: HashMap<ObjectId, SurfaceRecord>,
++    next_key: u64,
++    active: Option<ActiveWindow>,
++    bridges: Vec<ZglobalMenuBridgeV1>,
++    gtk_shells: Vec<GtkShell1>,
++    serial: u32,
++    last: Option<Published>,
++    capabilities: u32,
++}
++
++impl std::fmt::Debug for GlobalMenuState {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("GlobalMenuState")
++            .field("surfaces", &self.surfaces.len())
++            .field("active", &self.active)
++            .finish()
++    }
++}
++
++impl GlobalMenuState {
++    pub fn new<D>(
++        display: &DisplayHandle,
++        filter: impl Fn(&Client) -> bool + Send + Sync + 'static,
++    ) -> Self
++    where
++        D: GlobalDispatch<OrgKdeKwinAppmenuManager, ()>
++            + GlobalDispatch<GtkShell1, ()>
++            + GlobalDispatch<ZglobalMenuBridgeV1, BridgeGlobalData>
++            + 'static,
++    {
++        display.create_global::<D, OrgKdeKwinAppmenuManager, _>(2, ());
++        display.create_global::<D, GtkShell1, _>(1, ());
++        display.create_global::<D, ZglobalMenuBridgeV1, _>(1, BridgeGlobalData(Arc::new(filter)));
++        Self {
++            registry: MenuRegistry::default(),
++            surfaces: HashMap::new(),
++            next_key: 1,
++            active: None,
++            bridges: Vec::new(),
++            gtk_shells: Vec::new(),
++            serial: 0,
++            last: None,
++            capabilities: 0,
++        }
++    }
++
++    pub fn surface_key(&mut self, surface: &WlSurface) -> Result<u64, String> {
++        if let Some(record) = self.surfaces.get(&surface.id()) {
++            return Ok(record.data.key);
++        }
++        if self.surfaces.len() >= MAX_SURFACES {
++            return Err("Demasiadas superficies".into());
++        }
++        let key = self.next_key;
++        self.next_key = self
++            .next_key
++            .checked_add(1)
++            .ok_or("Identificadores agotados")?;
++        self.surfaces.insert(
++            surface.id(),
++            SurfaceRecord {
++                data: SurfaceResourceData {
++                    surface: surface.clone(),
++                    key,
++                },
++                dbus_owner: None,
++                gtk_owner: None,
++            },
++        );
++        Ok(key)
++    }
++
++    pub fn set_active(&mut self, active: Option<ActiveWindow>) {
++        self.active = active;
++    }
++    pub fn active(&self) -> Option<&ActiveWindow> {
++        self.active.as_ref()
++    }
++
++    fn published(&self) -> Published {
++        match self.active.as_ref() {
++            Some(active) if active.surface.as_ref().is_none_or(Resource::is_alive) => {
++                let menus = active
++                    .surface
++                    .as_ref()
++                    .and_then(|surface| self.surfaces.get(&surface.id()))
++                    .and_then(|record| self.registry.get(record.data.key))
++                    .cloned()
++                    .unwrap_or_default();
++                let mut info = active.info.clone();
++                info.title = clean_label(&info.title, 200);
++                info.app_id = clean_label(&info.app_id, 255);
++                Published {
++                    window: Some(info),
++                    menus,
++                }
++            }
++            _ => Published::default(),
++        }
++    }
++
++    pub fn refresh(&mut self) {
++        let registry = &mut self.registry;
++        self.surfaces.retain(|_, record| {
++            if record.data.surface.is_alive() {
++                true
++            } else {
++                registry.remove(record.data.key);
++                false
++            }
++        });
++        if self
++            .active
++            .as_ref()
++            .is_some_and(|a| a.surface.as_ref().is_some_and(|s| !s.is_alive()))
++        {
++            self.active = None;
++        }
++        self.bridges.retain(Resource::is_alive);
++        self.gtk_shells.retain(Resource::is_alive);
++        // GTK represents each capability enum entry as a bit position.
++        let caps = if self.bridges.is_empty() {
++            0
++        } else {
++            1 << gtk_shell1::Capability::GlobalMenuBar as u32
++        };
++        if caps != self.capabilities {
++            self.capabilities = caps;
++            for shell in &self.gtk_shells {
++                shell.capabilities(caps);
++            }
++        }
++        let published = self.published();
++        if self.last.as_ref() != Some(&published) {
++            self.serial = self.serial.wrapping_add(1);
++            for bridge in &self.bridges {
++                send_snapshot(bridge, self.serial, &published);
++            }
++            self.last = Some(published);
++        }
++    }
++
++    fn resource_data(&mut self, surface: &WlSurface) -> Result<SurfaceResourceData, String> {
++        Ok(SurfaceResourceData {
++            surface: surface.clone(),
++            key: self.surface_key(surface)?,
++        })
++    }
++}
++
++fn clean_label(value: &str, max: usize) -> String {
++    value
++        .chars()
++        .filter(|c| !c.is_control())
++        .take(max)
++        .collect()
++}
++
++fn send_snapshot(bridge: &ZglobalMenuBridgeV1, serial: u32, state: &Published) {
++    if let Some(window) = &state.window {
++        bridge.active(
++            serial,
++            window.id.to_string(),
++            window.app_id.clone(),
++            window.title.clone(),
++            window.pid,
++            window.xid,
++        );
++        if let Some(address) = &state.menus.dbusmenu {
++            bridge.dbusmenu(serial, address.bus_name.clone(), address.path.clone());
++        }
++        if let Some(address) = &state.menus.gtk {
++            bridge.gtk_menu(
++                serial,
++                address.bus_name.clone(),
++                address.menubar_path.clone(),
++                address.app_menu_path.clone(),
++                address.application_path.clone(),
++                address.window_path.clone(),
++            );
++        }
++    } else {
++        bridge.clear(serial);
++    }
++    bridge.done(serial);
++}
++
++impl<D> GlobalDispatch<ZglobalMenuBridgeV1, BridgeGlobalData, D> for GlobalMenuState
++where
++    D: GlobalDispatch<ZglobalMenuBridgeV1, BridgeGlobalData>
++        + Dispatch<ZglobalMenuBridgeV1, ()>
++        + GlobalMenuHandler
++        + 'static,
++{
++    fn bind(
++        state: &mut D,
++        _: &DisplayHandle,
++        _: &Client,
++        resource: New<ZglobalMenuBridgeV1>,
++        _: &BridgeGlobalData,
++        init: &mut DataInit<'_, D>,
++    ) {
++        let bridge = init.init(resource, ());
++        let menus = state.global_menu_state();
++        menus.bridges.push(bridge.clone());
++        menus.refresh();
++        send_snapshot(&bridge, menus.serial, &menus.published());
++    }
++    fn can_view(client: Client, data: &BridgeGlobalData) -> bool {
++        (data.0)(&client)
++    }
++}
++
++impl<D> Dispatch<ZglobalMenuBridgeV1, (), D> for GlobalMenuState
++where
++    D: Dispatch<ZglobalMenuBridgeV1, ()> + GlobalMenuHandler + 'static,
++{
++    fn request(
++        state: &mut D,
++        _: &Client,
++        resource: &ZglobalMenuBridgeV1,
++        request: zglobal_menu_bridge_v1::Request,
++        _: &(),
++        _: &DisplayHandle,
++        _: &mut DataInit<'_, D>,
++    ) {
++        if let zglobal_menu_bridge_v1::Request::GetSnapshot = request {
++            let menus = state.global_menu_state();
++            menus.refresh();
++            send_snapshot(resource, menus.serial, &menus.published());
++        }
++    }
++    fn destroyed(state: &mut D, _: ClientId, resource: &ZglobalMenuBridgeV1, _: &()) {
++        let menus = state.global_menu_state();
++        menus.bridges.retain(|bridge| bridge != resource);
++        menus.refresh();
++    }
++}
++
++impl<D> GlobalDispatch<OrgKdeKwinAppmenuManager, (), D> for GlobalMenuState
++where
++    D: GlobalDispatch<OrgKdeKwinAppmenuManager, ()>
++        + Dispatch<OrgKdeKwinAppmenuManager, ()>
++        + 'static,
++{
++    fn bind(
++        _: &mut D,
++        _: &DisplayHandle,
++        _: &Client,
++        resource: New<OrgKdeKwinAppmenuManager>,
++        _: &(),
++        init: &mut DataInit<'_, D>,
++    ) {
++        init.init(resource, ());
++    }
++}
++
++impl<D> Dispatch<OrgKdeKwinAppmenuManager, (), D> for GlobalMenuState
++where
++    D: Dispatch<OrgKdeKwinAppmenuManager, ()>
++        + Dispatch<OrgKdeKwinAppmenu, SurfaceResourceData>
++        + GlobalMenuHandler
++        + 'static,
++{
++    fn request(
++        state: &mut D,
++        client: &Client,
++        resource: &OrgKdeKwinAppmenuManager,
++        request: org_kde_kwin_appmenu_manager::Request,
++        _: &(),
++        _: &DisplayHandle,
++        init: &mut DataInit<'_, D>,
++    ) {
++        if let org_kde_kwin_appmenu_manager::Request::Create { id, surface } = request {
++            if surface.client().as_ref() != Some(client) {
++                resource.post_error(0u32, "Surface belongs to another client");
++                return;
++            }
++            let data = match state.global_menu_state().resource_data(&surface) {
++                Ok(data) => data,
++                Err(error) => {
++                    init.post_error(id, 0u32, error);
++                    return;
++                }
++            };
++            init.init(id, data);
++        }
++    }
++}
++
++impl<D> Dispatch<OrgKdeKwinAppmenu, SurfaceResourceData, D> for GlobalMenuState
++where
++    D: Dispatch<OrgKdeKwinAppmenu, SurfaceResourceData> + GlobalMenuHandler + 'static,
++{
++    fn request(
++        state: &mut D,
++        _: &Client,
++        resource: &OrgKdeKwinAppmenu,
++        request: org_kde_kwin_appmenu::Request,
++        data: &SurfaceResourceData,
++        _: &DisplayHandle,
++        _: &mut DataInit<'_, D>,
++    ) {
++        if let org_kde_kwin_appmenu::Request::SetAddress {
++            service_name,
++            object_path,
++        } = request
++        {
++            let menus = state.global_menu_state();
++            if menus
++                .registry
++                .set_dbusmenu(data.key, &service_name, &object_path)
++                .is_ok()
++            {
++                if let Some(record) = menus.surfaces.get_mut(&data.surface.id()) {
++                    record.dbus_owner = Some(resource.id());
++                }
++                menus.refresh();
++            }
++        }
++    }
++    fn destroyed(
++        state: &mut D,
++        _: ClientId,
++        resource: &OrgKdeKwinAppmenu,
++        data: &SurfaceResourceData,
++    ) {
++        let menus = state.global_menu_state();
++        if menus
++            .surfaces
++            .get(&data.surface.id())
++            .is_some_and(|r| r.dbus_owner.as_ref() == Some(&resource.id()))
++        {
++            menus.registry.clear_dbusmenu(data.key);
++            menus.refresh();
++        }
++    }
++}
++
++impl<D> GlobalDispatch<GtkShell1, (), D> for GlobalMenuState
++where
++    D: GlobalDispatch<GtkShell1, ()> + Dispatch<GtkShell1, ()> + GlobalMenuHandler + 'static,
++{
++    fn bind(
++        state: &mut D,
++        _: &DisplayHandle,
++        _: &Client,
++        resource: New<GtkShell1>,
++        _: &(),
++        init: &mut DataInit<'_, D>,
++    ) {
++        let shell = init.init(resource, ());
++        let menus = state.global_menu_state();
++        shell.capabilities(menus.capabilities);
++        menus.gtk_shells.push(shell);
++    }
++}
++
++impl<D> Dispatch<GtkShell1, (), D> for GlobalMenuState
++where
++    D: Dispatch<GtkShell1, ()>
++        + Dispatch<GtkSurface1, SurfaceResourceData>
++        + GlobalMenuHandler
++        + 'static,
++{
++    fn request(
++        state: &mut D,
++        client: &Client,
++        resource: &GtkShell1,
++        request: gtk_shell1::Request,
++        _: &(),
++        _: &DisplayHandle,
++        init: &mut DataInit<'_, D>,
++    ) {
++        if let gtk_shell1::Request::GetGtkSurface {
++            gtk_surface,
++            surface,
++        } = request
++        {
++            if surface.client().as_ref() != Some(client) {
++                resource.post_error(0u32, "Surface belongs to another client");
++                return;
++            }
++            let data = match state.global_menu_state().resource_data(&surface) {
++                Ok(data) => data,
++                Err(error) => {
++                    init.post_error(gtk_surface, 0u32, error);
++                    return;
++                }
++            };
++            init.init(gtk_surface, data);
++        }
++        // Other version-1 requests are advisory startup, bell and presentation
++        // hints. This extension deliberately does not grant activation privileges.
++    }
++}
++
++impl<D> Dispatch<GtkSurface1, SurfaceResourceData, D> for GlobalMenuState
++where
++    D: Dispatch<GtkSurface1, SurfaceResourceData> + GlobalMenuHandler + 'static,
++{
++    fn request(
++        state: &mut D,
++        _: &Client,
++        resource: &GtkSurface1,
++        request: gtk_surface1::Request,
++        data: &SurfaceResourceData,
++        _: &DisplayHandle,
++        _: &mut DataInit<'_, D>,
++    ) {
++        if let gtk_surface1::Request::SetDbusProperties {
++            unique_bus_name,
++            menubar_path,
++            app_menu_path,
++            application_object_path,
++            window_object_path,
++            ..
++        } = request
++        {
++            let address = GtkAddress {
++                bus_name: unique_bus_name.unwrap_or_default(),
++                menubar_path: menubar_path.unwrap_or_default(),
++                app_menu_path: app_menu_path.unwrap_or_default(),
++                application_path: application_object_path.unwrap_or_default(),
++                window_path: window_object_path.unwrap_or_default(),
++            };
++            let menus = state.global_menu_state();
++            if menus.registry.set_gtk(data.key, address).is_ok() {
++                if let Some(record) = menus.surfaces.get_mut(&data.surface.id()) {
++                    record.gtk_owner = Some(resource.id());
++                }
++                menus.refresh();
++            }
++        }
++    }
++    fn destroyed(state: &mut D, _: ClientId, resource: &GtkSurface1, data: &SurfaceResourceData) {
++        let menus = state.global_menu_state();
++        if menus
++            .surfaces
++            .get(&data.surface.id())
++            .is_some_and(|r| r.gtk_owner.as_ref() == Some(&resource.id()))
++        {
++            menus.registry.clear_gtk(data.key);
++            menus.refresh();
++        }
++    }
++}
++
++#[macro_export]
++macro_rules! delegate_global_menu {
++    ($ty:ty) => {
++        $crate::wayland_server::delegate_global_dispatch!($ty: [$crate::protocols::server::bridge::zglobal_menu_bridge_v1::ZglobalMenuBridgeV1: $crate::BridgeGlobalData] => $crate::GlobalMenuState);
++        $crate::wayland_server::delegate_dispatch!($ty: [$crate::protocols::server::bridge::zglobal_menu_bridge_v1::ZglobalMenuBridgeV1: ()] => $crate::GlobalMenuState);
++        $crate::wayland_server::delegate_global_dispatch!($ty: [$crate::protocols::server::appmenu::org_kde_kwin_appmenu_manager::OrgKdeKwinAppmenuManager: ()] => $crate::GlobalMenuState);
++        $crate::wayland_server::delegate_dispatch!($ty: [$crate::protocols::server::appmenu::org_kde_kwin_appmenu_manager::OrgKdeKwinAppmenuManager: ()] => $crate::GlobalMenuState);
++        $crate::wayland_server::delegate_dispatch!($ty: [$crate::protocols::server::appmenu::org_kde_kwin_appmenu::OrgKdeKwinAppmenu: $crate::SurfaceResourceData] => $crate::GlobalMenuState);
++        $crate::wayland_server::delegate_global_dispatch!($ty: [$crate::protocols::server::gtk::gtk_shell1::GtkShell1: ()] => $crate::GlobalMenuState);
++        $crate::wayland_server::delegate_dispatch!($ty: [$crate::protocols::server::gtk::gtk_shell1::GtkShell1: ()] => $crate::GlobalMenuState);
++        $crate::wayland_server::delegate_dispatch!($ty: [$crate::protocols::server::gtk::gtk_surface1::GtkSurface1: $crate::SurfaceResourceData] => $crate::GlobalMenuState);
++    };
++}

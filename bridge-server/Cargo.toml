@@ -1,0 +1,19 @@
+[package]
+name = "cosmic-global-menu-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[features]
+default = ["client"]
+client = ["dep:wayland-client"]
+
+[dependencies]
+wayland-backend = "0.3"
+wayland-client = { version = "0.31", optional = true }
+wayland-server = "0.31"
+wayland-scanner = "0.31"
+zbus_names = "4"
+
+[dev-dependencies]
+wayland-client = "0.31"
