@@ -1,0 +1,85 @@
+Mejoras aplicadas a esta copia (3 de octubre de 2026)
+=====================================================
+
+La versión instalada en este PC NO se ha tocado: sigue siendo la original.
+Todo lo de abajo está solo en la carpeta global-menu@wticllasuca.local de aquí.
+
+1. Clics perdidos en los menús de Firefox, Chromium y Qt
+   Si la app tardaba más de 150 ms en responder, el clic en un elemento del
+   menú (por ejemplo "Guardar") a veces no llegaba nunca. Ahora el menú espera
+   a que el clic salga antes de liberarse.
+   Archivo: impl/r15/realMenu.js
+   Probado con una app simulada lenta (600 ms): la original pierde el clic,
+   la corregida lo entrega.
+
+2. Los atajos personalizados de los menús no funcionaban nunca
+   Usaban Clutter.accelerator_parse, que no existe en GNOME 50; el error se
+   ocultaba. Ahora usan el mismo emisor de teclas que el resto de menús, y
+   acepta formas como <Control>T, <Primary>return, <Mod1>Left o F11.
+   Archivos: impl/r15/menuManager.js, impl/r15/nativeMenus.js
+
+3. Copiar, Pegar, Deshacer... de los menús genéricos
+   Se creaba un teclado virtual nuevo en cada clic y las teclas se enviaban
+   mientras el menú aún tenía el teclado. Ahora usan el emisor compartido,
+   que espera a que el menú se cierre y no depende de la distribución
+   del teclado.
+   Archivo: impl/r15/menuManager.js
+
+4. Ventanas que perdían su menú por el título
+   Cualquier ventana cuyo título contuviera "nautilus", "gjs", "mutter" o
+   "gnome-shell" (una pestaña del navegador, un documento) mostraba los menús
+   del escritorio. Ahora solo se compara el identificador de la app.
+   Archivo: impl/r15/menuManager.js
+   Probado: con un documento "nautilus-notas.txt" la original mostraba
+   "Nautilus"; la corregida muestra "Editor de texto".
+
+5. "Salir de <app>" cerraba solo la ventana enfocada
+   En apps sin acción de salir propia, ahora pide cerrar todas sus ventanas
+   (la app aún puede preguntar si hay cambios sin guardar).
+   Archivo: impl/r15/menuManager.js
+
+
+Soporte para GNOME 51 y velocidad (versión 15+real.4)
+=====================================================
+
+Probado de verdad en GNOME Shell 51.0 (Fedora Rawhide, en un contenedor) y
+en GNOME Shell 50.1 (este PC). En los dos: la extensión carga sin errores,
+el ayudante nativo funciona, los menús reales y genéricos se muestran bien,
+los clics llegan a las apps y las preferencias abren.
+
+6. Compatible con GNOME 51
+   - metadata.json declara "51".
+   - Los atajos de teclado de los menús fallaban en GNOME 51:
+     Clutter.get_default_backend() ya no existe. Ahora se usa la forma que
+     sirve en 50 y en 51.
+   - Los submenús en cascada ya no dependen de un método interno que
+     GNOME 51 quitó (las flechas siguen funcionando igual).
+   Archivos: impl/r15/nativeMenus.js, impl/r15/cascade.js, metadata.json
+
+7. Ayudante nativo para cualquier versión y distribución
+   GNOME 51 usa libmutter-51 (GNOME 50 usaba libmutter-18), así que el
+   ayudante hay que compilarlo en cada equipo; instalar.sh lo hace solo.
+   build.sh ahora usa la librería que usa GNOME de verdad, también en
+   Fedora (/usr/lib64), y no una vieja que haya quedado de una
+   actualización.
+   Archivos: native/build.sh, instalar.sh
+
+8. Más rápido al cambiar de ventana
+   Antes cada cambio de ventana rehacía toda la barra: unos 22 ms, más que
+   un fotograma de pantalla. Ahora:
+   - los menús se rellenan la primera vez que se abren, no antes;
+   - los botones de la barra se reutilizan en vez de destruirse y crearse;
+   - si el foco vuelve a la misma ventana (al cerrar un diálogo) no se
+     rehace nada.
+   Resultado medido: ~5 ms por cambio de ventana, 0 ms al volver a la
+   misma, en GNOME 50 y en 51.
+   Archivos: impl/r15/menuManager.js, impl/r15/main.js
+
+9. Apps GTK 3 escritas en GJS o Python
+   Se identificaban por el intérprete ("gjs") y mostraban los menús del
+   escritorio. Ahora se usa el identificador de la app.
+   Archivo: impl/r15/menuManager.js
+
+10. Texto de ayuda de "Custom Menus" en Preferencias
+    No se veía porque <Control><Alt>t se tomaba como formato.
+    Archivo: prefs.js

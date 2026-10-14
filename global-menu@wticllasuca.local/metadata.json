@@ -1,0 +1,17 @@
+{
+  "description": "Local fork of Global Menu for GNOME (ShiroOSL) that shows the real menu bar of the focused app. Reads GTK menus (org.gtk.Menus) and DBusMenu, and provides both com.canonical.AppMenu.Registrar and the org_kde_kwin_appmenu Wayland protocol (native helper in native/), so Chromium, Firefox, Qt, Electron, LibreOffice and GTK menu bars work on native Wayland. GTK 4 apps without a menu bar get their exported actions. Apps that export nothing keep the generic menus.",
+  "name": "Global Menu (real app menus)",
+  "settings-schema": "org.gnome.shell.extensions.globalmenu",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50",
+    "51"
+  ],
+  "url": "https://github.com/ShiroOSL/global-menu-for-gnome",
+  "uuid": "global-menu@wticllasuca.local",
+  "version-name": "15+real.4"
+}

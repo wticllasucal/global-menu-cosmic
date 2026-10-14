@@ -1,0 +1,10 @@
+[/]
+clipboard-enabled=true
+clock-position='far-right'
+hide-overview-button=true
+logo-custom-icon-path=''
+logo-distro-icon='freebsd'
+screenshot-button-enabled=true
+show-app-grid=true
+show-app-icon=false
+window-list-enabled=true

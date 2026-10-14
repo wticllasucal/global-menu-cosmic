@@ -1,0 +1,30 @@
+Global Menu (real app menus) - copia para instalar en otro equipo
+==================================================================
+
+Contenido
+  global-menu@wticllasuca.local/   la extensión, tal como está instalada y activa
+  ajustes.dconf                    tus ajustes de la extensión (sin el historial del portapapeles)
+  instalar.sh                      instalador
+
+Requisitos del otro equipo
+  - GNOME Shell 45 a 51 (probada en 50 y 51).
+  - El ayudante nativo incluido es para GNOME 50 en x86_64. En GNOME 51 (u otra
+    versión) el instalador lo recompila solo; para eso hacen falta:
+      Ubuntu/Debian: sudo apt install gcc pkg-config libwayland-dev libglib2.0-dev \
+                         gobject-introspection libgirepository1.0-dev
+      Fedora:        sudo dnf install gcc pkgconf-pkg-config wayland-devel glib2-devel \
+                         gobject-introspection-devel
+    Si no se puede compilar, la extensión funciona igual pero sin los menús
+    reales de Chromium, Firefox y Qt 6 en Wayland nativo.
+
+Instalación
+  1. Copia esta carpeta completa al otro equipo.
+  2. En una terminal, dentro de la carpeta:   bash instalar.sh
+  3. Cierra la sesión y vuelve a entrar.
+  4. gnome-extensions enable global-menu@wticllasuca.local
+
+Notas
+  - Las aplicaciones deben abrirse después de activar la extensión para que
+    exporten su menú.
+  - Firefox: en about:config poner en true widget.gtk.global-menu.enabled y
+    widget.gtk.global-menu.wayland.enabled.
