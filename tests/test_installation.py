@@ -1,4 +1,5 @@
 import importlib.util
+import configparser
 from pathlib import Path
 import tempfile
 import unittest
@@ -41,6 +42,17 @@ class InstallationTests(unittest.TestCase):
         with self.assertRaises(installer.InstallError):
             self.install()
         self.assertEqual(target.read_text(), "user program")
+
+    def test_panel_launcher_requests_the_host_display_for_the_installed_applet(self):
+        installer.install(self.home, self.binary, ROOT / "data/local.wticllasuca.GlobalMenu.desktop")
+        desktop = configparser.ConfigParser(interpolation=None)
+        desktop.optionxform = str
+        desktop.read(self.home / ".local/share/applications/local.wticllasuca.GlobalMenu.desktop")
+        entry = desktop["Desktop Entry"]
+        # cosmic-panel's wrapper_space launcher tests presence of this key
+        # to supply WAYLAND_DISPLAY and X_PRIVILEGED_WAYLAND_SOCKET.
+        requests_host = entry.get("X-HostWaylandDisplay") is not None
+        self.assertTrue(requests_host, "The official panel launcher would omit the host socket")
 
     def test_modified_installation_is_not_removed(self):
         self.install()

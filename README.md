@@ -53,6 +53,10 @@ En equipos con poca memoria usa `CARGO_BUILD_JOBS=1`.
 `e1f2cd2e52226aa50d59bb2cd6d43ffe290106ed`. Las pruebas sin `--features ui`
 no requieren iniciar el escritorio.
 
+El panel solicita la conexión al compositor con `X-HostWaylandDisplay`.
+El puente consume `X_PRIVILEGED_WAYLAND_SOCKET` por separado de la conexión
+gráfica del applet; su entrega real dentro del panel sigue pendiente de prueba.
+
 ## Instalar o retirar solo el applet
 
 ```sh
@@ -150,7 +154,8 @@ sh tools/verify.sh
 ```
 
 Ejecuta formato Rust, pruebas con bus D-Bus aislado, pruebas de instalación y
-parche, y `cargo check` del applet con UI. Las pruebas no necesitan aplicaciones
+parche, `cargo check` y pruebas unitarias del controlador de UI del applet.
+Las pruebas no necesitan aplicaciones
 instaladas ni acceden al bus de la sesión del usuario. El comando no inicia
 COSMIC ni instala nada. Los resultados de este equipo y la lista de pruebas
 manuales pendientes están en [VERIFICACION.md](VERIFICACION.md).

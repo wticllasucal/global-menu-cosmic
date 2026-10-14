@@ -72,6 +72,21 @@ class PatchTests(unittest.TestCase):
             self.run_patcher("revert")
         self.assertEqual(external.read_text(), "after\n")
 
+    def test_patch_installs_the_bundled_bridge_and_integration_sources(self):
+        self.git("apply", "--include=src/wayland/handlers/global_menu.rs",
+                 "--include=vendor/cosmic-global-menu-bridge/*",
+                 str(ROOT / "compositor/global-menu.patch"))
+        manifest = json.loads((ROOT / "compositor/manifest.json").read_text())
+        sources = {"src/wayland/handlers/global_menu.rs": ROOT / "compositor/integration.rs"}
+        prefix = "vendor/cosmic-global-menu-bridge/"
+        sources.update({path: ROOT / "bridge-server" / path.removeprefix(prefix)
+                        for path in manifest if path.startswith(prefix)})
+        for path, source in sources.items():
+            with self.subTest(path=path):
+                installed = (self.repo / path).read_bytes()
+                self.assertEqual(installed, source.read_bytes())
+                self.assertEqual(hashlib.sha256(installed).hexdigest(), manifest[path]["after"])
+
 
 if __name__ == "__main__":
     unittest.main()

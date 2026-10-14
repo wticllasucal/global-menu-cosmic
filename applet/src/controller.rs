@@ -106,6 +106,7 @@ pub enum ControllerEvent {
 pub enum BackendCommand {
     Open { generation: u64, action: MenuAction },
     Activate { generation: u64, action: MenuAction },
+    Close { action: MenuAction },
     Retry,
 }
 
@@ -196,11 +197,18 @@ pub async fn run_with_bridge(
                 biased;
                 _ = events.closed() => return,
                 changed = bridge.changed() => { if changed.is_err() { return; } reload = true; },
+                update = updates.next() => {
+                    if update.is_none() { break; }
+                    // Invalidate before dispatching any queued click from the old tree.
+                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                    while let Some(Some(_)) = updates.next().now_or_never() {}
+                    reload = true;
+                }
                 command = commands.recv() => {
                     let Some(command) = command else { return; };
                     let requested = match &command {
                         BackendCommand::Open { generation, .. } | BackendCommand::Activate { generation, .. } => *generation,
-                        BackendCommand::Retry => generation,
+                        BackendCommand::Retry | BackendCommand::Close { .. } => generation,
                     };
                     if requested != generation {
                         let _ = events.send(ControllerEvent::ActionResult { generation: requested, error: Some("La ventana o el menú cambiaron; acción descartada".into()) }).await;
@@ -209,16 +217,15 @@ pub async fn run_with_bridge(
                     let result = match command {
                         BackendCommand::Open { action, .. } => { reload = true; backend.about_to_show(&action).await },
                         BackendCommand::Activate { action, .. } => backend.activate(&action).await,
+                        BackendCommand::Close { action } => {
+                            // Cleanup targets the original unique owner, even after a
+                            // generation change, and must not erase an activation error.
+                            let _ = backend.close_submenu(&action).await;
+                            continue;
+                        },
                         BackendCommand::Retry => { reload = true; Ok(()) },
                     };
                     let _ = events.send(ControllerEvent::ActionResult { generation, error: result.err().map(|error| format!("{error:#}")) }).await;
-                }
-                update = updates.next() => {
-                    if update.is_none() { break; }
-                    // Coalesce bursts while applications replace entire menus.
-                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-                    while let Some(Some(_)) = updates.next().now_or_never() {}
-                    reload = true;
                 }
             }
         }

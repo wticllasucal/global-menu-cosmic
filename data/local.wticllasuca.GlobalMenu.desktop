@@ -9,5 +9,5 @@ Icon=view-list-symbolic
 Terminal=false
 NoDisplay=true
 X-CosmicApplet=true
-X-CosmicApplet-RequestsWaylandDisplay=true
+X-HostWaylandDisplay=true
 Categories=Utility;

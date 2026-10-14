@@ -3,7 +3,7 @@ pub use cosmic_global_menu_bridge::{DbusAddress, FocusInput, FocusPolicy, GtkAdd
 use std::sync::Arc;
 use zbus::zvariant::{OwnedValue, Signature};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ActionKind {
     DbusMenu(i32),
     Gtk {
@@ -14,7 +14,7 @@ pub enum ActionKind {
     GtkSubmenu(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MenuAction {
     /// Always a unique bus owner, never a reassignable well-known name.
     pub address: DbusAddress,
@@ -24,6 +24,7 @@ pub struct MenuAction {
 
 #[derive(Clone, Debug, Default)]
 pub struct MenuNode {
+    pub identity: Option<MenuIdentity>,
     pub label: String,
     pub enabled: bool,
     pub visible: bool,
@@ -34,12 +35,27 @@ pub struct MenuNode {
     pub children: Vec<MenuNode>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuIdentity {
+    DbusMenu(DbusAddress, i32),
+    GtkMenu(DbusAddress, u32, u32),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WindowSnapshot {
     pub serial: u32,
     pub window: Option<WindowInfo>,
     pub dbusmenu: Option<DbusAddress>,
     pub gtk: Option<GtkAddress>,
+}
+
+impl WindowSnapshot {
+    pub fn same_destination(&self, other: &Self) -> bool {
+        let identity = |snapshot: &Self| snapshot.window.as_ref().map(|w| (w.id, w.pid, w.xid));
+        identity(self) == identity(other)
+            && self.dbusmenu == other.dbusmenu
+            && self.gtk == other.gtk
+    }
 }
 
 #[derive(Clone, Debug)]

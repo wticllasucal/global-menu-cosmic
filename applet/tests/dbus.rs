@@ -212,6 +212,33 @@ async fn disappearing_exporter_is_not_replaced_by_new_owner() {
 }
 
 struct GtkMenus;
+#[tokio::test]
+async fn reloading_same_destination_never_adopts_a_replacement_owner() {
+    let (original, _) = exporter(false, false).await;
+    original
+        .request_name("test.GlobalMenuReloadOwner")
+        .await
+        .unwrap();
+    let mut source = snapshot(&original);
+    source.dbusmenu.as_mut().unwrap().bus_name = "test.GlobalMenuReloadOwner".into();
+    let mut backend = MenuBackend::connect().await.unwrap();
+    backend.load(&source).await.unwrap();
+    original.close().await.unwrap();
+    let (replacement, calls) = exporter(false, false).await;
+    replacement
+        .request_name("test.GlobalMenuReloadOwner")
+        .await
+        .unwrap();
+    source.serial += 1;
+    source.window.as_mut().unwrap().title = "Another title".into();
+    let reloaded = backend.load(&source).await;
+    assert!(
+        reloaded.is_err(),
+        "A title/serial change must not rebind this window to a new exporter: {reloaded:?}"
+    );
+    assert!(calls.lock().unwrap().is_empty());
+}
+
 #[zbus::interface(name = "org.gtk.Menus")]
 impl GtkMenus {
     fn start(&self, groups: Vec<u32>) -> Vec<(u32, u32, Vec<Properties>)> {
@@ -230,6 +257,162 @@ impl GtkMenus {
 }
 
 struct HugeGtk;
+struct SlowCleanupGtk {
+    ends: Arc<Mutex<Vec<Vec<u32>>>>,
+}
+#[zbus::interface(name = "org.gtk.Menus")]
+impl SlowCleanupGtk {
+    fn start(&self, groups: Vec<u32>) -> Vec<(u32, u32, Vec<Properties>)> {
+        if groups != vec![0] {
+            return vec![];
+        }
+        let mut file = props("File");
+        file.insert(
+            ":submenu".into(),
+            Structure::from((1u32, 0u32)).try_into().unwrap(),
+        );
+        vec![(0, 0, vec![file])]
+    }
+    async fn end(&self, groups: Vec<u32>) {
+        self.ends.lock().unwrap().push(groups);
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    }
+}
+
+#[tokio::test]
+async fn slow_gtk_cleanup_never_uses_the_next_windows_read_budget() {
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let gtk = Builder::session()
+        .unwrap()
+        .serve_at("/Menus", SlowCleanupGtk { ends: ends.clone() })
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let (fast, _) = exporter(false, false).await;
+    let mut backend = MenuBackend::connect().await.unwrap();
+    backend.load(&gtk_snapshot(&gtk)).await.unwrap();
+    let tree = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        backend.load(&snapshot(&fast)),
+    )
+    .await
+    .expect("End must not block the current window")
+    .unwrap();
+    assert_eq!(tree[0].label, "File");
+    // Cancelling a later read must not cancel cleanup already dispatched.
+    let (slow, _) = exporter(false, true).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            backend.load(&snapshot(&slow))
+        )
+        .await
+        .is_err()
+    );
+    backend.load(&snapshot(&fast)).await.unwrap();
+    assert_eq!(*ends.lock().unwrap(), vec![vec![0, 1]]);
+}
+
+struct OmittedGtk {
+    link: Option<&'static str>,
+    cycle: bool,
+}
+#[zbus::interface(name = "org.gtk.Menus")]
+impl OmittedGtk {
+    fn start(&self, groups: Vec<u32>) -> Vec<(u32, u32, Vec<Properties>)> {
+        if groups != vec![0] {
+            return vec![];
+        }
+        let Some(link) = self.link else {
+            return vec![];
+        };
+        let mut root = props("File");
+        root.insert(
+            link.into(),
+            Structure::from((if self.cycle { 0u32 } else { 1 }, 0u32))
+                .try_into()
+                .unwrap(),
+        );
+        vec![(0, 0, vec![root])]
+    }
+    fn end(&self, _groups: Vec<u32>) {}
+}
+
+fn gtk_snapshot(connection: &Connection) -> WindowSnapshot {
+    WindowSnapshot {
+        window: Some(WindowInfo {
+            id: 1,
+            ..Default::default()
+        }),
+        gtk: Some(GtkAddress {
+            bus_name: connection.unique_name().unwrap().to_string(),
+            menubar_path: "/Menus".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+async fn omitted_gtk(link: Option<&'static str>, cycle: bool) -> Connection {
+    Builder::session()
+        .unwrap()
+        .serve_at("/Menus", OmittedGtk { link, cycle })
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn gtk_omitted_empty_root_is_an_empty_menu() {
+    let bus = omitted_gtk(None, false).await;
+    assert!(
+        MenuBackend::connect()
+            .await
+            .unwrap()
+            .load(&gtk_snapshot(&bus))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+#[tokio::test]
+async fn gtk_omitted_empty_section_does_not_reject_the_tree() {
+    let bus = omitted_gtk(Some(":section"), false).await;
+    assert!(
+        MenuBackend::connect()
+            .await
+            .unwrap()
+            .load(&gtk_snapshot(&bus))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+#[tokio::test]
+async fn gtk_omitted_empty_submenu_can_still_be_opened() {
+    let bus = omitted_gtk(Some(":submenu"), false).await;
+    let tree = MenuBackend::connect()
+        .await
+        .unwrap()
+        .load(&gtk_snapshot(&bus))
+        .await
+        .unwrap();
+    assert_eq!(tree[0].label, "File");
+    assert!(tree[0].submenu && tree[0].children.is_empty());
+}
+#[tokio::test]
+async fn gtk_cycle_is_still_rejected() {
+    let bus = omitted_gtk(Some(":submenu"), true).await;
+    assert!(
+        MenuBackend::connect()
+            .await
+            .unwrap()
+            .load(&gtk_snapshot(&bus))
+            .await
+            .is_err()
+    );
+}
+
 #[zbus::interface(name = "org.gtk.Menus")]
 impl HugeGtk {
     fn start(&self, _groups: Vec<u32>) -> Vec<(u32, u32, Vec<Properties>)> {
@@ -321,6 +504,95 @@ async fn unrelated_bus_owner_changes_do_not_reload_the_active_menu() {
     );
 }
 type GtkCalls = Arc<Mutex<Vec<(String, Vec<OwnedValue>)>>>;
+struct SubmenuMenus;
+#[zbus::interface(name = "org.gtk.Menus")]
+impl SubmenuMenus {
+    fn start(&self, _groups: Vec<u32>) -> Vec<(u32, u32, Vec<Properties>)> {
+        let mut file = props("File");
+        file.insert(
+            ":submenu".into(),
+            Structure::from((0u32, 1u32)).try_into().unwrap(),
+        );
+        file.insert("submenu-action".into(), text("app.file"));
+        vec![(0, 0, vec![file])]
+    }
+    fn end(&self, _groups: Vec<u32>) {}
+}
+struct SubmenuActions {
+    states: Arc<Mutex<Vec<bool>>>,
+}
+#[zbus::interface(name = "org.gtk.Actions")]
+impl SubmenuActions {
+    fn describe_all(&self) -> HashMap<String, (bool, Signature, Vec<OwnedValue>)> {
+        HashMap::from([(
+            "file".into(),
+            (true, Signature::try_from("").unwrap(), vec![false.into()]),
+        )])
+    }
+    fn set_state(&self, name: String, value: OwnedValue, _platform: Properties) {
+        assert_eq!(name, "file");
+        self.states
+            .lock()
+            .unwrap()
+            .push(bool::try_from(&value).unwrap());
+    }
+}
+#[tokio::test]
+async fn gtk_submenu_close_restores_false_on_the_original_unique_owner() {
+    let states = Arc::new(Mutex::new(Vec::new()));
+    let original = Builder::session()
+        .unwrap()
+        .serve_at("/Menus", SubmenuMenus)
+        .unwrap()
+        .serve_at(
+            "/Actions",
+            SubmenuActions {
+                states: states.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    original
+        .request_name("test.GlobalMenuSubmenuOwner")
+        .await
+        .unwrap();
+    let mut source = gtk_snapshot(&original);
+    source.gtk.as_mut().unwrap().bus_name = "test.GlobalMenuSubmenuOwner".into();
+    source.gtk.as_mut().unwrap().application_path = "/Actions".into();
+    let mut backend = MenuBackend::connect().await.unwrap();
+    let action = backend.load(&source).await.unwrap()[0]
+        .action
+        .clone()
+        .unwrap();
+    backend.about_to_show(&action).await.unwrap();
+    original
+        .release_name("test.GlobalMenuSubmenuOwner")
+        .await
+        .unwrap();
+    let other_states = Arc::new(Mutex::new(Vec::new()));
+    let replacement = Builder::session()
+        .unwrap()
+        .serve_at(
+            "/Actions",
+            SubmenuActions {
+                states: other_states.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    replacement
+        .request_name("test.GlobalMenuSubmenuOwner")
+        .await
+        .unwrap();
+    backend.close_submenu(&action).await.unwrap();
+    assert_eq!(*states.lock().unwrap(), vec![true, false]);
+    assert!(other_states.lock().unwrap().is_empty());
+}
+
 struct GtkActions {
     calls: GtkCalls,
 }

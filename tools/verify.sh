@@ -15,3 +15,4 @@ fi
 dbus-run-session -- "$cargo" test --workspace --no-default-features --locked
 python3 -m unittest discover -s tests -v
 "$cargo" check -p cosmic-global-menu --features ui --locked
+dbus-run-session -- "$cargo" test -p cosmic-global-menu --features ui --bin cosmic-global-menu --locked

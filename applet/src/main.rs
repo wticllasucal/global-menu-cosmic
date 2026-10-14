@@ -8,7 +8,7 @@ use cosmic::{
 };
 use cosmic_global_menu::{
     controller::{self, BackendCommand, ControllerEvent, MenuStatus, UiState},
-    model::MenuNode,
+    model::{ActionKind, MenuAction, MenuIdentity, MenuNode},
 };
 use futures_util::SinkExt;
 use tokio::sync::mpsc;
@@ -33,6 +33,8 @@ struct GlobalMenu {
     commands: Option<mpsc::Sender<BackendCommand>>,
     popup: Option<window::Id>,
     path: Vec<usize>,
+    ancestry: Vec<MenuIdentity>,
+    opened_gtk: Vec<MenuAction>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,20 +99,24 @@ impl cosmic::Application for GlobalMenu {
         match message {
             Message::Connected(sender) => self.commands = Some(sender),
             Message::Backend(ControllerEvent::Snapshot(snapshot)) => {
-                let previous = self
+                let same = self
                     .state
                     .snapshot
                     .as_ref()
-                    .and_then(|s| s.window.as_ref())
-                    .map(|w| w.id);
-                let next = snapshot.window.as_ref().map(|w| w.id);
+                    .is_some_and(|old| old.same_destination(&snapshot));
                 self.state.select(snapshot);
-                if previous != next {
+                if !same {
                     return self.close_popup();
                 }
             }
             Message::Backend(ControllerEvent::Menus { generation, result }) => {
-                self.state.loaded(generation, result)
+                self.state.loaded(generation, result);
+                if generation == self.state.generation
+                    && self.popup.is_some()
+                    && !self.rebase_path()
+                {
+                    return self.close_popup();
+                }
             }
             Message::Backend(ControllerEvent::Disconnected(error)) => {
                 self.state.disconnect(error);
@@ -118,7 +124,11 @@ impl cosmic::Application for GlobalMenu {
             }
             Message::Backend(ControllerEvent::ActionResult { generation, error }) => {
                 if generation == self.state.generation {
-                    self.state.detail = error.unwrap_or_default();
+                    if let Some(error) = error {
+                        self.state.loaded(generation, Err(error));
+                    } else {
+                        self.state.detail.clear();
+                    }
                 }
             }
             Message::Open(generation, path, rectangle) => {
@@ -130,13 +140,17 @@ impl cosmic::Application for GlobalMenu {
                         return self.update(Message::Choose(generation, path));
                     }
                 }
+                let Some(ancestry) = self.capture_path(&path) else {
+                    return Task::none();
+                };
+                let old = self.close_popup();
                 self.path = path;
+                self.ancestry = ancestry;
                 self.prepare_menu();
                 let Some(parent) = self.core.main_window_id() else {
                     return Task::none();
                 };
                 let id = window::Id::unique();
-                let old = self.close_popup();
                 self.popup = Some(id);
                 let mut settings = self
                     .core
@@ -159,7 +173,13 @@ impl cosmic::Application for GlobalMenu {
                 if generation != self.state.generation {
                     return Task::none();
                 }
+                let Some(ancestry) = self.capture_path(&path) else {
+                    return Task::none();
+                };
+                let keep = self.gtk_actions_in_path(&path);
+                self.close_gtk_except(&keep);
                 self.path = path;
+                self.ancestry = ancestry;
                 self.prepare_menu();
             }
             Message::Choose(generation, path) => {
@@ -180,6 +200,9 @@ impl cosmic::Application for GlobalMenu {
             Message::PopupClosed(id) => {
                 if self.popup == Some(id) {
                     self.popup = None;
+                    self.close_gtk_except(&[]);
+                    self.path.clear();
+                    self.ancestry.clear();
                 }
             }
         }
@@ -203,13 +226,16 @@ impl cosmic::Application for GlobalMenu {
             .map(|w| w.app_id.as_str())
             .filter(|s| !s.is_empty())
             .unwrap_or("Menú global");
-        let name: String = app
+        let mut name: String = app
             .rsplit('.')
             .next()
             .unwrap_or(app)
             .chars()
             .take(22)
             .collect();
+        if self.state.status == MenuStatus::Failed {
+            name.push_str(" · error");
+        }
         let app_button = widget::button::custom(widget::text(name))
             .class(cosmic::theme::Button::AppletMenu)
             .padding([4, 8])
@@ -378,6 +404,55 @@ impl cosmic::Application for GlobalMenu {
 }
 
 impl GlobalMenu {
+    fn gtk_actions_in_path(&self, path: &[usize]) -> Vec<MenuAction> {
+        (1..=path.len())
+            .filter_map(|depth| self.node(&path[..depth])?.action.clone())
+            .filter(|action| matches!(action.kind, ActionKind::GtkSubmenu(_)))
+            .collect()
+    }
+    fn close_gtk_except(&mut self, keep: &[MenuAction]) {
+        let opened = std::mem::take(&mut self.opened_gtk);
+        for action in opened.into_iter().rev() {
+            if keep
+                .iter()
+                .any(|k| k.address == action.address && k.kind == action.kind)
+            {
+                self.opened_gtk.push(action);
+            } else {
+                self.send(BackendCommand::Close { action });
+            }
+        }
+        self.opened_gtk.reverse();
+    }
+    fn capture_path(&self, path: &[usize]) -> Option<Vec<MenuIdentity>> {
+        let mut ancestry = Vec::new();
+        for depth in 1..=path.len() {
+            let node = self.node(&path[..depth])?;
+            if !node.visible || !node.enabled || (!node.submenu && node.children.is_empty()) {
+                return None;
+            }
+            ancestry.push(node.identity.clone()?);
+        }
+        Some(ancestry)
+    }
+    fn rebase_path(&mut self) -> bool {
+        let mut path = Vec::new();
+        let mut nodes = &self.state.nodes;
+        for identity in &self.ancestry {
+            let Some(index) = nodes.iter().position(|n| {
+                n.identity.as_ref() == Some(identity)
+                    && n.visible
+                    && n.enabled
+                    && (n.submenu || !n.children.is_empty())
+            }) else {
+                return false;
+            };
+            path.push(index);
+            nodes = &nodes[index].children;
+        }
+        self.path = path;
+        true
+    }
     fn node(&self, path: &[usize]) -> Option<&MenuNode> {
         self.state.node_at(self.state.generation, path)
     }
@@ -393,6 +468,16 @@ impl GlobalMenu {
     }
     fn prepare_menu(&mut self) {
         if let Some(action) = self.node(&self.path).and_then(|n| n.action.clone()) {
+            if matches!(action.kind, ActionKind::GtkSubmenu(_)) {
+                if self
+                    .opened_gtk
+                    .iter()
+                    .any(|old| old.address == action.address && old.kind == action.kind)
+                {
+                    return;
+                }
+                self.opened_gtk.push(action.clone());
+            }
             self.send(BackendCommand::Open {
                 generation: self.state.generation,
                 action,
@@ -400,9 +485,190 @@ impl GlobalMenu {
         }
     }
     fn close_popup(&mut self) -> Task<Message> {
+        self.close_gtk_except(&[]);
+        self.path.clear();
+        self.ancestry.clear();
         self.popup
             .take()
             .map(destroy_popup)
             .unwrap_or_else(Task::none)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::Application;
+    use cosmic_global_menu::model::{
+        ActionKind, DbusAddress, MenuAction, WindowInfo, WindowSnapshot,
+    };
+
+    fn menu(id: i32, label: &str) -> MenuNode {
+        MenuNode {
+            identity: Some(MenuIdentity::DbusMenu(
+                DbusAddress::new(":1.1", "/Menu").unwrap(),
+                id,
+            )),
+            label: label.into(),
+            enabled: true,
+            visible: true,
+            submenu: true,
+            action: Some(MenuAction {
+                address: DbusAddress::new(":1.1", "/Menu").unwrap(),
+                kind: ActionKind::DbusMenu(id),
+                enabled: true,
+            }),
+            ..Default::default()
+        }
+    }
+    fn open_file() -> GlobalMenu {
+        let mut app = GlobalMenu::default();
+        let source = WindowSnapshot {
+            window: Some(WindowInfo {
+                id: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let generation = app.state.select(source);
+        app.state
+            .loaded(generation, Ok(vec![menu(10, "File"), menu(20, "Edit")]));
+        let _ = app.update(Message::Open(generation, vec![0], Rectangle::default()));
+        app.popup = Some(window::Id::unique());
+        app
+    }
+    #[test]
+    fn removed_open_menu_closes_instead_of_becoming_its_neighbor() {
+        let mut app = open_file();
+        let _ = app.update(Message::Backend(ControllerEvent::Menus {
+            generation: app.state.generation,
+            result: Ok(vec![menu(20, "Edit")]),
+        }));
+        assert!(
+            app.popup.is_none(),
+            "The File popup must not silently become Edit"
+        );
+    }
+    #[test]
+    fn inserted_menu_rebases_the_open_popup_by_exported_identity() {
+        let mut app = open_file();
+        let _ = app.update(Message::Backend(ControllerEvent::Menus {
+            generation: app.state.generation,
+            result: Ok(vec![menu(30, "New"), menu(10, "File"), menu(20, "Edit")]),
+        }));
+        assert_eq!(app.path, vec![1]);
+        assert_eq!(app.node(&app.path).unwrap().label, "File");
+    }
+    #[test]
+    fn removed_ancestor_closes_even_if_the_leaf_moves_to_another_menu() {
+        let mut app = open_file();
+        app.state.nodes[0].children = vec![menu(11, "Recent")];
+        let _ = app.update(Message::Navigate(app.state.generation, vec![0, 0]));
+        let mut edit = menu(20, "Edit");
+        edit.children = vec![menu(11, "Recent")];
+        let _ = app.update(Message::Backend(ControllerEvent::Menus {
+            generation: app.state.generation,
+            result: Ok(vec![edit]),
+        }));
+        assert!(
+            app.popup.is_none(),
+            "Every ancestor must retain its exported identity"
+        );
+    }
+    #[test]
+    fn activation_error_is_visible_after_the_popup_closes() {
+        let mut app = open_file();
+        let generation = app.state.generation;
+        let _ = app.update(Message::Choose(generation, vec![0]));
+        assert!(app.popup.is_none());
+        let _ = app.update(Message::Backend(ControllerEvent::ActionResult {
+            generation,
+            error: Some("Event timed out".into()),
+        }));
+        assert_eq!(
+            app.state.status,
+            MenuStatus::Failed,
+            "The panel must show the failure even without a popup"
+        );
+        assert!(app.state.nodes.is_empty());
+        assert_eq!(app.state.detail, "Event timed out");
+    }
+    fn gtk_menu(group: u32, name: &str) -> MenuNode {
+        MenuNode {
+            identity: Some(MenuIdentity::GtkMenu(
+                DbusAddress::new(":1.1", "/Menus").unwrap(),
+                group,
+                0,
+            )),
+            label: name.into(),
+            visible: true,
+            enabled: true,
+            submenu: true,
+            action: Some(MenuAction {
+                address: DbusAddress::new(":1.1", "/Actions").unwrap(),
+                kind: ActionKind::GtkSubmenu(name.into()),
+                enabled: true,
+            }),
+            ..Default::default()
+        }
+    }
+    fn open_gtk() -> (GlobalMenu, mpsc::Receiver<BackendCommand>) {
+        let mut app = GlobalMenu::default();
+        let generation = app.state.select(WindowSnapshot {
+            window: Some(WindowInfo {
+                id: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut file = gtk_menu(1, "file");
+        file.children = vec![gtk_menu(2, "recent")];
+        app.state.loaded(generation, Ok(vec![file]));
+        let (commands, receiver) = mpsc::channel(8);
+        app.commands = Some(commands);
+        let _ = app.update(Message::Open(generation, vec![0], Rectangle::default()));
+        app.popup = Some(window::Id::unique());
+        (app, receiver)
+    }
+    #[test]
+    fn closing_the_popup_sends_gtk_state_cleanup() {
+        let (mut app, mut commands) = open_gtk();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            BackendCommand::Open { .. }
+        ));
+        let _ = app.on_escape();
+        let close = commands
+            .try_recv()
+            .expect("Closing must restore the GTK submenu state");
+        let BackendCommand::Close { action } = close else {
+            panic!("Closing must send state cleanup, not another Open");
+        };
+        assert_eq!(action.kind, ActionKind::GtkSubmenu("file".into()));
+        assert_eq!(action.address.bus_name, ":1.1");
+    }
+    #[test]
+    fn navigating_back_closes_only_the_child_gtk_submenu() {
+        let (mut app, mut commands) = open_gtk();
+        commands.try_recv().unwrap();
+        let _ = app.update(Message::Navigate(app.state.generation, vec![0, 0]));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            BackendCommand::Open { .. }
+        ));
+        let _ = app.update(Message::Navigate(app.state.generation, vec![0]));
+        let close = commands
+            .try_recv()
+            .expect("Back must close the child submenu");
+        let BackendCommand::Close { action } = close else {
+            panic!("Back must not reopen its already-open parent");
+        };
+        assert_eq!(action.kind, ActionKind::GtkSubmenu("recent".into()));
+        assert!(commands.try_recv().is_err());
+        let _ = app.on_escape();
+        let BackendCommand::Close { action } = commands.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(action.kind, ActionKind::GtkSubmenu("file".into()));
     }
 }

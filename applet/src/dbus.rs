@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
-use crate::model::{ActionKind, DbusAddress, GtkAddress, MenuAction, MenuNode, WindowSnapshot};
+use crate::model::{
+    ActionKind, DbusAddress, GtkAddress, MenuAction, MenuIdentity, MenuNode, WindowSnapshot,
+};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use futures_util::{Stream, StreamExt};
 use std::{
@@ -22,6 +24,7 @@ const DBUSMENU: &str = "com.canonical.dbusmenu";
 const GTK_MENUS: &str = "org.gtk.Menus";
 const GTK_ACTIONS: &str = "org.gtk.Actions";
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(3);
+const CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const MAX_DEPTH: usize = 12;
 const MAX_NODES: usize = 5000;
@@ -147,6 +150,14 @@ pub struct MenuBackend {
     watched: Watched,
     registrations: Registrations,
     gtk_subscriptions: Vec<(DbusAddress, Vec<u32>)>,
+    selected: Option<WindowSnapshot>,
+    owners: Mutex<HashMap<String, String>>,
+}
+
+impl Drop for MenuBackend {
+    fn drop(&mut self) {
+        self.release_gtk_subscriptions();
+    }
 }
 
 impl MenuBackend {
@@ -178,6 +189,8 @@ impl MenuBackend {
             watched: Arc::new(Mutex::new(HashSet::new())),
             registrations,
             gtk_subscriptions: Vec::new(),
+            selected: None,
+            owners: Mutex::new(HashMap::new()),
         })
     }
 
@@ -233,45 +246,53 @@ impl MenuBackend {
     }
 
     pub async fn load(&mut self, snapshot: &WindowSnapshot) -> Result<Vec<MenuNode>> {
+        self.release_gtk_subscriptions();
+        if self
+            .selected
+            .as_ref()
+            .is_none_or(|old| !old.same_destination(snapshot))
+        {
+            self.owners.lock().unwrap().clear();
+            self.selected = Some(snapshot.clone());
+        }
         tokio::time::timeout(CALL_TIMEOUT, self.load_inner(snapshot))
             .await
             .context("Tiempo de espera del exportador agotado")?
     }
 
+    fn release_gtk_subscriptions(&mut self) {
+        let subscriptions = std::mem::take(&mut self.gtk_subscriptions);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        for (address, groups) in subscriptions {
+            if groups.is_empty() {
+                continue;
+            }
+            let connection = self.connection.clone();
+            // Detached bounded cleanup survives cancellation of the next load.
+            // End is only ever sent to the old unique owner.
+            runtime.spawn(async move {
+                let _ = tokio::time::timeout(
+                    CLEANUP_TIMEOUT,
+                    connection.call_method(
+                        Some(address.bus_name.as_str()),
+                        address.path.as_str(),
+                        Some(GTK_MENUS),
+                        "End",
+                        &(groups,),
+                    ),
+                )
+                .await;
+            });
+        }
+    }
+
     async fn load_inner(&mut self, snapshot: &WindowSnapshot) -> Result<Vec<MenuNode>> {
-        // A second panel instance shares the existing registrar. If its owner
-        // exits, claim the now-free name without ever stealing it.
-        match self
-            .connection
-            .request_name_with_flags(REGISTRAR, zbus::fdo::RequestNameFlags::DoNotQueue.into())
-            .await
-        {
-            Ok(_) | Err(zbus::Error::NameTaken) => {}
-            Err(error) => return Err(error.into()),
-        }
-        for (address, groups) in self.gtk_subscriptions.drain(..) {
-            let proxy = Proxy::new(
-                &self.connection,
-                address.bus_name.as_str(),
-                address.path.as_str(),
-                GTK_MENUS,
-            )
-            .await?;
-            // A vanished owner cannot receive End; that is normal on a focus change.
-            let _ = proxy.call::<_, _, ()>("End", &(groups,)).await;
-        }
         self.watched.lock().unwrap().clear();
         let Some(window) = &snapshot.window else {
             return Ok(Vec::new());
         };
-        let registrar_owner = DBusProxy::new(&self.connection)
-            .await?
-            .get_name_owner(zbus::names::BusName::try_from(REGISTRAR)?)
-            .await?;
-        self.watch(&DbusAddress {
-            bus_name: registrar_owner.to_string(),
-            path: REGISTRAR_PATH.into(),
-        });
         if let Some(address) = &snapshot.dbusmenu {
             return self.load_dbusmenu(address).await;
         }
@@ -279,8 +300,31 @@ impl MenuBackend {
             return self.load_gtk(address).await;
         }
         if window.xid != 0 {
-            let registrar =
-                Proxy::new(&self.connection, REGISTRAR, REGISTRAR_PATH, REGISTRAR).await?;
+            // Native exports do not depend on a separate registrar's lifetime.
+            // XID lookup may claim a now-free name, but never steals or queues it.
+            match self
+                .connection
+                .request_name_with_flags(REGISTRAR, zbus::fdo::RequestNameFlags::DoNotQueue.into())
+                .await
+            {
+                Ok(_) | Err(zbus::Error::NameTaken) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let registrar_owner = DBusProxy::new(&self.connection)
+                .await?
+                .get_name_owner(zbus::names::BusName::try_from(REGISTRAR)?)
+                .await?;
+            self.watch(&DbusAddress {
+                bus_name: registrar_owner.to_string(),
+                path: REGISTRAR_PATH.into(),
+            });
+            let registrar = Proxy::new(
+                &self.connection,
+                registrar_owner.as_str(),
+                REGISTRAR_PATH,
+                REGISTRAR,
+            )
+            .await?;
             let (service, path): (String, OwnedObjectPath) =
                 registrar.call("GetMenuForWindow", &(window.xid,)).await?;
             if !service.is_empty() {
@@ -305,10 +349,22 @@ impl MenuBackend {
 
     async fn pin(&self, address: &DbusAddress) -> Result<DbusAddress> {
         DbusAddress::new(&address.bus_name, &address.path).map_err(|e| anyhow!(e))?;
+        if let Some(owner) = self.owners.lock().unwrap().get(&address.bus_name) {
+            return Ok(DbusAddress {
+                bus_name: owner.clone(),
+                path: address.path.clone(),
+            });
+        }
         let bus = DBusProxy::new(&self.connection).await?;
         let owner = bus
             .get_name_owner(zbus::names::BusName::try_from(address.bus_name.as_str())?)
             .await?;
+        // Keep the first owner for this destination, even after it vanishes.
+        // Signals, retries and title/serial changes are not a new menu export.
+        self.owners
+            .lock()
+            .unwrap()
+            .insert(address.bus_name.clone(), owner.to_string());
         Ok(DbusAddress {
             bus_name: owner.to_string(),
             path: address.path.clone(),
@@ -465,6 +521,8 @@ impl MenuBackend {
         parse_gtk(
             (0, 0),
             &menu_data,
+            &groups,
+            &pinned,
             &actions,
             0,
             &mut count,
@@ -558,6 +616,29 @@ impl MenuBackend {
         .await
         .context("Tiempo de espera del submenú agotado")?
     }
+
+    pub async fn close_submenu(&self, action: &MenuAction) -> Result<()> {
+        let ActionKind::GtkSubmenu(name) = &action.kind else {
+            return Ok(());
+        };
+        ensure!(
+            action.address.bus_name.starts_with(':'),
+            "El cierre requiere un propietario único"
+        );
+        tokio::time::timeout(
+            CLEANUP_TIMEOUT,
+            self.connection.call_method(
+                Some(action.address.bus_name.as_str()),
+                action.address.path.as_str(),
+                Some(GTK_ACTIONS),
+                "SetState",
+                &(name, Value::from(false), Properties::new()),
+            ),
+        )
+        .await
+        .context("Tiempo de espera del cierre agotado")??;
+        Ok(())
+    }
 }
 
 fn label(value: &str) -> String {
@@ -610,6 +691,7 @@ fn parse_layout(
             == Some(1)
     });
     Ok(MenuNode {
+        identity: Some(MenuIdentity::DbusMenu(address.clone(), id)),
         label: label(string(&props, "label").unwrap_or_default()),
         enabled,
         visible: boolean(&props, "visible", true),
@@ -633,6 +715,8 @@ type GtkDescription = HashMap<String, (DbusAddress, String, (bool, Signature, Ve
 fn parse_gtk(
     key: (u32, u32),
     menus: &HashMap<(u32, u32), Vec<Properties>>,
+    groups: &HashSet<u32>,
+    address: &DbusAddress,
     actions: &GtkDescription,
     depth: usize,
     count: &mut usize,
@@ -642,9 +726,9 @@ fn parse_gtk(
         depth <= MAX_DEPTH && visiting.insert(key),
         "Ciclo o límite de profundidad GTK"
     );
-    let items = menus
-        .get(&key)
-        .ok_or_else(|| anyhow!("Falta un submenú GTK"))?;
+    ensure!(groups.contains(&key.0), "Grupo GTK no consultado");
+    // GLib's Start response omits empty menus, including the root.
+    let items = menus.get(&key).map(Vec::as_slice).unwrap_or_default();
     let mut output = Vec::new();
     for props in items {
         *count += 1;
@@ -653,6 +737,8 @@ fn parse_gtk(
             let section_items = parse_gtk(
                 gtk_link(section)?,
                 menus,
+                groups,
+                address,
                 actions,
                 depth + 1,
                 count,
@@ -670,10 +756,13 @@ fn parse_gtk(
             }
             continue;
         }
-        let children = if let Some(submenu) = props.get(":submenu") {
+        let submenu = props.get(":submenu").map(gtk_link).transpose()?;
+        let children = if let Some(submenu) = submenu {
             parse_gtk(
-                gtk_link(submenu)?,
+                submenu,
                 menus,
+                groups,
+                address,
                 actions,
                 depth + 1,
                 count,
@@ -719,6 +808,8 @@ fn parse_gtk(
             _ => true,
         };
         output.push(MenuNode {
+            identity: submenu
+                .map(|(group, menu)| MenuIdentity::GtkMenu(address.clone(), group, menu)),
             label: label(string(props, "label").unwrap_or_default()),
             enabled,
             visible,
